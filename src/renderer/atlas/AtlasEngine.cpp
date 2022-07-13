@@ -353,6 +353,8 @@ try
 
     if constexpr (debugGlyphGenerationPerformance)
     {
+        _r.glyphs.reset();
+        _r.tileAllocator.reset();
         _api.dirtyRect = til::rect{ 0, 0, _api.cellCount.x, _api.cellCount.y };
     }
     else
@@ -617,7 +619,10 @@ try
         }
 
         const u32x2 newColors{ gsl::narrow_cast<u32>(fg), gsl::narrow_cast<u32>(bg) };
-        const AtlasKeyAttributes attributes{ 0, textAttributes.IsIntense(), textAttributes.IsItalic(), 0 };
+
+        auto attributes = AtlasEntryKeyAttributes::None;
+        WI_SetFlagIf(attributes, AtlasEntryKeyAttributes::Intense, textAttributes.IsIntense());
+        WI_SetFlagIf(attributes, AtlasEntryKeyAttributes::Italic, textAttributes.IsItalic());
 
         if (_api.attributes != attributes)
         {
@@ -874,10 +879,11 @@ void AtlasEngine::_recreateSizeDependentResources()
     //   You can use ID3D11DeviceContext::ClearState to ensure that all [internal] references are released.
     if (_r.renderTargetView)
     {
+        const auto supportsFrameLatencyWaitableObject = !debugGeneralPerformance && IsWindows8Point1OrGreater();
         _r.renderTargetView.reset();
         _r.deviceContext->ClearState();
         _r.deviceContext->Flush();
-        THROW_IF_FAILED(_r.swapChain->ResizeBuffers(0, _api.sizeInPixel.x, _api.sizeInPixel.y, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT));
+        THROW_IF_FAILED(_r.swapChain->ResizeBuffers(0, _api.sizeInPixel.x, _api.sizeInPixel.y, DXGI_FORMAT_UNKNOWN, supportsFrameLatencyWaitableObject ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0));
     }
 
     // The RenderTargetView is later used with OMSetRenderTargets
@@ -1024,38 +1030,41 @@ void AtlasEngine::_recreateFontDependentResources()
             }
         });
 
-        for (auto italic = 0; italic < 2; ++italic)
+        static_assert(WI_EnumValue(AtlasEntryKeyAttributes::Intense) == 0x1);
+        static_assert(WI_EnumValue(AtlasEntryKeyAttributes::Italic) == 0x2);
+        static_assert(ARRAYSIZE(_r.textFormats) == 4);
+
+        for (u16 attributes = 0; attributes < 4; ++attributes)
         {
-            for (auto bold = 0; bold < 2; ++bold)
+            const auto intense = WI_IsFlagSet(static_cast<AtlasEntryKeyAttributes>(attributes), AtlasEntryKeyAttributes::Intense);
+            const auto italic = WI_IsFlagSet(static_cast<AtlasEntryKeyAttributes>(attributes), AtlasEntryKeyAttributes::Italic);
+            const auto fontWeight = intense ? DWRITE_FONT_WEIGHT_BOLD : static_cast<DWRITE_FONT_WEIGHT>(_api.fontMetrics.fontWeight);
+            const auto fontStyle = italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL;
+            auto& textFormat = _r.textFormats[attributes];
+
+            THROW_IF_FAILED(_sr.dwriteFactory->CreateTextFormat(_api.fontMetrics.fontName.get(), _api.fontMetrics.fontCollection.get(), fontWeight, fontStyle, DWRITE_FONT_STRETCH_NORMAL, _api.fontMetrics.fontSizeInDIP, L"", textFormat.put()));
+            textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            textFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+
+            // DWRITE_LINE_SPACING_METHOD_UNIFORM:
+            // > Lines are explicitly set to uniform spacing, regardless of contained font sizes.
+            // > This can be useful to avoid the uneven appearance that can occur from font fallback.
+            // We want that. Otherwise fallback fonts might be rendered with an incorrect baseline and get cut off vertically.
+            THROW_IF_FAILED(textFormat->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, _r.cellSizeDIP.y, _api.fontMetrics.baselineInDIP));
+
+            if (!_api.fontAxisValues.empty())
             {
-                const auto fontWeight = bold ? DWRITE_FONT_WEIGHT_BOLD : static_cast<DWRITE_FONT_WEIGHT>(_api.fontMetrics.fontWeight);
-                const auto fontStyle = italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL;
-                auto& textFormat = _r.textFormats[italic][bold];
-
-                THROW_IF_FAILED(_sr.dwriteFactory->CreateTextFormat(_api.fontMetrics.fontName.get(), _api.fontMetrics.fontCollection.get(), fontWeight, fontStyle, DWRITE_FONT_STRETCH_NORMAL, _api.fontMetrics.fontSizeInDIP, L"", textFormat.put()));
-                textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                textFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-
-                // DWRITE_LINE_SPACING_METHOD_UNIFORM:
-                // > Lines are explicitly set to uniform spacing, regardless of contained font sizes.
-                // > This can be useful to avoid the uneven appearance that can occur from font fallback.
-                // We want that. Otherwise fallback fonts might be rendered with an incorrect baseline and get cut off vertically.
-                THROW_IF_FAILED(textFormat->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, _r.cellSizeDIP.y, _api.fontMetrics.baselineInDIP));
-
-                if (!_api.fontAxisValues.empty())
+                if (const auto textFormat3 = textFormat.try_query<IDWriteTextFormat3>())
                 {
-                    if (const auto textFormat3 = textFormat.try_query<IDWriteTextFormat3>())
-                    {
-                        // The wght axis defaults to the font weight.
-                        _api.fontAxisValues[0].value = bold || standardAxes[0].value == -1.0f ? static_cast<float>(fontWeight) : standardAxes[0].value;
-                        // The ital axis defaults to 1 if this is italic and 0 otherwise.
-                        _api.fontAxisValues[1].value = italic ? 1.0f : (standardAxes[1].value == -1.0f ? 0.0f : standardAxes[1].value);
-                        // The slnt axis defaults to -12 if this is italic and 0 otherwise.
-                        _api.fontAxisValues[2].value = italic ? -12.0f : (standardAxes[2].value == -1.0f ? 0.0f : standardAxes[2].value);
+                    // The wght axis defaults to the font weight.
+                    _api.fontAxisValues[0].value = intense || standardAxes[0].value == -1.0f ? static_cast<float>(fontWeight) : standardAxes[0].value;
+                    // The ital axis defaults to 1 if this is italic and 0 otherwise.
+                    _api.fontAxisValues[1].value = italic ? 1.0f : (standardAxes[1].value == -1.0f ? 0.0f : standardAxes[1].value);
+                    // The slnt axis defaults to -12 if this is italic and 0 otherwise.
+                    _api.fontAxisValues[2].value = italic ? -12.0f : (standardAxes[2].value == -1.0f ? 0.0f : standardAxes[2].value);
 
-                        THROW_IF_FAILED(textFormat3->SetFontAxisValues(_api.fontAxisValues.data(), gsl::narrow_cast<u32>(_api.fontAxisValues.size())));
-                        _r.textFormatAxes[italic][bold] = { _api.fontAxisValues.data(), _api.fontAxisValues.size() };
-                    }
+                    THROW_IF_FAILED(textFormat3->SetFontAxisValues(_api.fontAxisValues.data(), gsl::narrow_cast<u32>(_api.fontAxisValues.size())));
+                    _r.textFormatAxes[attributes] = { _api.fontAxisValues.data(), _api.fontAxisValues.size() };
                 }
             }
         }
@@ -1077,14 +1086,14 @@ void AtlasEngine::_recreateFontDependentResources()
     WI_SetAllFlags(_r.invalidations, RenderInvalidations::Cursor | RenderInvalidations::ConstBuffer);
 }
 
-IDWriteTextFormat* AtlasEngine::_getTextFormat(bool bold, bool italic) const noexcept
+IDWriteTextFormat* AtlasEngine::_getTextFormat(AtlasEntryKeyAttributes attributes) const noexcept
 {
-    return _r.textFormats[italic][bold].get();
+    return _r.textFormats[static_cast<size_t>(attributes)].get();
 }
 
-const AtlasEngine::Buffer<DWRITE_FONT_AXIS_VALUE>& AtlasEngine::_getTextFormatAxis(bool bold, bool italic) const noexcept
+const AtlasEngine::Buffer<DWRITE_FONT_AXIS_VALUE>& AtlasEngine::_getTextFormatAxis(AtlasEntryKeyAttributes attributes) const noexcept
 {
-    return _r.textFormatAxes[italic][bold];
+    return _r.textFormatAxes[static_cast<size_t>(attributes)];
 }
 
 AtlasEngine::Cell* AtlasEngine::_getCell(u16 x, u16 y) noexcept
@@ -1174,8 +1183,8 @@ void AtlasEngine::_flushBufferLine()
     //
     // Font fallback with IDWriteFontFallback::MapCharacters is very slow.
 
-    const auto textFormat = _getTextFormat(_api.attributes.bold, _api.attributes.italic);
-    const auto& textFormatAxis = _getTextFormatAxis(_api.attributes.bold, _api.attributes.italic);
+    const auto textFormat = _getTextFormat(_api.attributes);
+    const auto& textFormatAxis = _getTextFormatAxis(_api.attributes);
 
     TextAnalyzer atlasAnalyzer{ _api.bufferLine, _api.analysisResults };
 
@@ -1210,8 +1219,8 @@ void AtlasEngine::_flushBufferLine()
             }
             else
             {
-                const auto baseWeight = _api.attributes.bold ? DWRITE_FONT_WEIGHT_BOLD : static_cast<DWRITE_FONT_WEIGHT>(_api.fontMetrics.fontWeight);
-                const auto baseStyle = _api.attributes.italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL;
+                const auto baseWeight = WI_IsFlagSet(_api.attributes, AtlasEntryKeyAttributes::Intense) ? DWRITE_FONT_WEIGHT_BOLD : static_cast<DWRITE_FONT_WEIGHT>(_api.fontMetrics.fontWeight);
+                const auto baseStyle = WI_IsFlagSet(_api.attributes, AtlasEntryKeyAttributes::Italic) ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL;
                 wil::com_ptr<IDWriteFont> font;
 
                 THROW_IF_FAILED(_sr.systemFontFallback->MapCharacters(
@@ -1266,8 +1275,8 @@ void AtlasEngine::_flushBufferLine()
         {
             if (!mappedFontFace)
             {
-                const auto baseWeight = _api.attributes.bold ? DWRITE_FONT_WEIGHT_BOLD : static_cast<DWRITE_FONT_WEIGHT>(_api.fontMetrics.fontWeight);
-                const auto baseStyle = _api.attributes.italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL;
+                const auto baseWeight = WI_IsFlagSet(_api.attributes, AtlasEntryKeyAttributes::Intense) ? DWRITE_FONT_WEIGHT_BOLD : static_cast<DWRITE_FONT_WEIGHT>(_api.fontMetrics.fontWeight);
+                const auto baseStyle = WI_IsFlagSet(_api.attributes, AtlasEntryKeyAttributes::Italic) ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL;
 
                 wil::com_ptr<IDWriteFontFamily> fontFamily;
                 THROW_IF_FAILED(fontCollection->GetFontFamily(0, fontFamily.addressof()));
@@ -1434,13 +1443,10 @@ void AtlasEngine::_emplaceGlyph(IDWriteFontFace* fontFace, size_t bufferPos1, si
 
     const u16 cellCount = x2 - x1;
 
-    auto attributes = _api.attributes;
-    attributes.cellCount = cellCount;
+    bool inserted = false;
+    const AtlasEntry* entry = _r.glyphs.findOrInsert(_api.attributes, gsl::narrow<u16>(charCount), cellCount, chars, inserted);
 
-    AtlasKey key{ attributes, gsl::narrow<u16>(charCount), chars };
-    auto it = _r.glyphs.find(key);
-
-    if (it == _r.glyphs.end())
+    if (inserted)
     {
         // Do fonts exist *in practice* which contain both colored and uncolored glyphs? I'm pretty sure...
         // However doing it properly means using either of:
@@ -1461,32 +1467,27 @@ void AtlasEngine::_emplaceGlyph(IDWriteFontFace* fontFace, size_t bufferPos1, si
         //
         // So this is a job for future me/someone.
         // Bonus points for doing it without impacting performance.
-        auto flags = CellFlags::None;
+        entry->value->flags = CellFlags::None;
         if (fontFace)
         {
             const auto fontFace2 = wil::try_com_query<IDWriteFontFace2>(fontFace);
-            WI_SetFlagIf(flags, CellFlags::ColoredGlyph, fontFace2 && fontFace2->IsColorFont());
+            WI_SetFlagIf(entry->value->flags, CellFlags::ColoredGlyph, fontFace2 && fontFace2->IsColorFont());
         }
-
-        // The AtlasValue constructor fills the `coords` variable with a pointer to an array
-        // of at least `cellCount` elements. I did this so that I don't have to type out
-        // `value.data()->coords` again, despite the constructor having all the data necessary.
-        u16x2* coords;
-        AtlasValue value{ flags, cellCount, &coords };
 
         for (u16 i = 0; i < cellCount; ++i)
         {
-            coords[i] = _r.tileAllocator.allocate(_r.glyphs);
+            entry->value->coords[i] = _r.tileAllocator.allocate(_r.glyphs);
         }
 
-        it = _r.glyphs.insert(std::move(key), std::move(value));
-        _r.glyphQueue.emplace_back(&it->first, &it->second);
+        _r.glyphQueue.emplace_back(entry);
     }
 
-    const auto valueData = it->second.data();
-    const auto coords = &valueData->coords[0];
-    const auto cells = _getCell(x1, _api.lastPaintBufferLineCoord.y);
-    const auto cellGlyphMappings = _getCellGlyphMapping(x1, _api.lastPaintBufferLineCoord.y);
+    // For some reason MSVC doesn't understand that valueRef is overwritten in the branch above, resulting in:
+    //   C26430: Symbol 'valueRef' is not tested for nullness on all paths (f.23).
+    __assume(entry != nullptr);
+
+    const auto coords = &entry->value->coords[0];
+    const auto data = _getCell(x1, _api.lastPaintBufferLineCoord.y);
 
     for (u32 i = 0; i < cellCount; ++i)
     {
@@ -1494,9 +1495,9 @@ void AtlasEngine::_emplaceGlyph(IDWriteFontFace* fontFace, size_t bufferPos1, si
         // We should apply the column color and flags from each column (instead
         // of copying them from the x1) so that ligatures can appear in multiple
         // colors with different line styles.
-        cells[i].flags = valueData->flags | _api.bufferLineMetadata[static_cast<size_t>(x1) + i].flags;
-        cells[i].color = _api.bufferLineMetadata[static_cast<size_t>(x1) + i].colors;
+        data[i].flags = entry->value->flags | _api.bufferLineMetadata[static_cast<size_t>(x1) + i].flags;
+        data[i].color = _api.bufferLineMetadata[static_cast<size_t>(x1) + i].colors;
     }
 
-    std::fill_n(cellGlyphMappings, cellCount, it);
+    std::fill_n(cellGlyphMappings, cellCount, entry);
 }

@@ -6,6 +6,7 @@
 #include <d2d1.h>
 #include <d3d11_1.h>
 #include <dwrite_3.h>
+#include <memory_resource>
 
 #include "../../renderer/inc/IRenderEngine.hpp"
 
@@ -147,6 +148,8 @@ namespace Microsoft::Console::Render
         using u32x2 = vec2<u32>;
 
         using i32 = int32_t;
+
+        using u64 = uint64_t;
 
         using f32 = float;
         using f32x2 = vec2<f32>;
@@ -303,88 +306,6 @@ namespace Microsoft::Console::Render
             size_t _size = 0;
         };
 
-        // This structure works similar to how std::string works:
-        // You can think of a std::string as a structure consisting of:
-        //   char*  data;
-        //   size_t size;
-        //   size_t capacity;
-        // where data is some backing memory allocated on the heap.
-        //
-        // But std::string employs an optimization called "small string optimization" (SSO).
-        // To simplify things it could be explained as:
-        // If the string capacity is small, then the characters are stored inside the "data"
-        // pointer and you make sure to set the lowest bit in the pointer one way or another.
-        // Heap allocations are always aligned by at least 4-8 bytes on any platform.
-        // If the address of the "data" pointer is not even you know data is stored inline.
-        template<typename T>
-        union SmallObjectOptimizer
-        {
-            static_assert(std::is_trivially_copyable_v<T>);
-            static_assert(std::has_unique_object_representations_v<T>);
-
-            T* allocated = nullptr;
-            T inlined;
-
-            constexpr SmallObjectOptimizer() = default;
-
-            SmallObjectOptimizer(const SmallObjectOptimizer& other) = delete;
-            SmallObjectOptimizer& operator=(const SmallObjectOptimizer& other) = delete;
-
-            SmallObjectOptimizer(SmallObjectOptimizer&& other) noexcept
-            {
-                memcpy(this, &other, std::max(sizeof(allocated), sizeof(inlined)));
-                other.allocated = nullptr;
-            }
-
-            SmallObjectOptimizer& operator=(SmallObjectOptimizer&& other) noexcept
-            {
-                return *new (this) SmallObjectOptimizer(other);
-            }
-
-            ~SmallObjectOptimizer()
-            {
-                if (!is_inline())
-                {
-#pragma warning(suppress : 26408) // Avoid malloc() and free(), prefer the nothrow version of new with delete (r.10).
-                    free(allocated);
-                }
-            }
-
-            T* initialize(size_t byteSize)
-            {
-                if (would_inline(byteSize))
-                {
-                    return &inlined;
-                }
-
-#pragma warning(suppress : 26408) // Avoid malloc() and free(), prefer the nothrow version of new with delete (r.10).
-                allocated = THROW_IF_NULL_ALLOC(static_cast<T*>(malloc(byteSize)));
-                return allocated;
-            }
-
-            constexpr bool would_inline(size_t byteSize) const noexcept
-            {
-                return byteSize <= sizeof(T);
-            }
-
-            bool is_inline() const noexcept
-            {
-                // VSO-1430353: __builtin_bitcast crashes the compiler under /permissive-. (BODGY)
-#pragma warning(suppress : 26490) // Don't use reinterpret_cast (type.1).
-                return (reinterpret_cast<uintptr_t>(allocated) & 1) != 0;
-            }
-
-            const T* data() const noexcept
-            {
-                return is_inline() ? &inlined : allocated;
-            }
-
-            size_t size() const noexcept
-            {
-                return is_inline() ? sizeof(inlined) : _msize(allocated);
-            }
-        };
-
         struct FontMetrics
         {
             wil::com_ptr<IDWriteFontCollection> fontCollection;
@@ -405,13 +326,13 @@ namespace Microsoft::Console::Render
         enum class CellFlags : u32
         {
             None            = 0x00000000,
-            Inlined         = 0x00000001,
+            HeapdKey        = 0x00000001,
+            HeapdCoords     = 0x00000002,
 
-            ColoredGlyph    = 0x00000002,
+            ColoredGlyph    = 0x00000004,
 
             Cursor          = 0x00000008,
             Selected        = 0x00000010,
-
             BorderLeft      = 0x00000020,
             BorderTop       = 0x00000040,
             BorderRight     = 0x00000080,
@@ -433,199 +354,546 @@ namespace Microsoft::Console::Render
             u32x2 color;
         };
 
-        struct AtlasKeyAttributes
+        enum class AtlasEntryKeyAttributes : u16
         {
-            u16 inlined : 1;
-            u16 bold : 1;
-            u16 italic : 1;
-            u16 cellCount : 13;
-
-            ATLAS_POD_OPS(AtlasKeyAttributes)
+            None = 0x0,
+            Intense = 0x1,
+            Italic = 0x2,
+            // The Intense and Italic flags are used to directly index into arrays.
+            // If you ever add more flags here, make sure to fix _getTextFormat()
+            // and _getTextFormatAxis() and to add a `& 3` mask for instance.
         };
+        ATLAS_FLAG_OPS(AtlasEntryKeyAttributes, u16)
 
-        struct AtlasKeyData
+        // AtlasEntryKey will be hashed as a series of u32 values.
+        struct alignas(u32) AtlasEntryKey
         {
-            AtlasKeyAttributes attributes;
+            AtlasEntryKeyAttributes attributes;
             u16 charCount;
-            wchar_t chars[14];
+            u16 coordCount;
+            wchar_t chars[1];
         };
 
-        struct AtlasKey
-        {
-            AtlasKey(AtlasKeyAttributes attributes, u16 charCount, const wchar_t* chars)
-            {
-                const auto size = dataSize(charCount);
-                const auto data = _data.initialize(size);
-                attributes.inlined = _data.would_inline(size);
-                data->attributes = attributes;
-                data->charCount = charCount;
-                memcpy(&data->chars[0], chars, static_cast<size_t>(charCount) * sizeof(AtlasKeyData::chars[0]));
-            }
-
-            const AtlasKeyData* data() const noexcept
-            {
-                return _data.data();
-            }
-
-            size_t hash() const noexcept
-            {
-                const auto d = data();
-#pragma warning(suppress : 26490) // Don't use reinterpret_cast (type.1).
-                return std::_Fnv1a_append_bytes(std::_FNV_offset_basis, reinterpret_cast<const u8*>(d), dataSize(d->charCount));
-            }
-
-            bool operator==(const AtlasKey& rhs) const noexcept
-            {
-                const auto a = data();
-                const auto b = rhs.data();
-                return a->charCount == b->charCount && memcmp(a, b, dataSize(a->charCount)) == 0;
-            }
-
-        private:
-            SmallObjectOptimizer<AtlasKeyData> _data;
-
-            static constexpr size_t dataSize(u16 charCount) noexcept
-            {
-                // This returns the actual byte size of a AtlasKeyData struct for the given charCount.
-                // The `wchar_t chars[2]` is only a buffer for the inlined variant after
-                // all and the actual charCount can be smaller or larger. Due to this we
-                // remove the size of the `chars` array and add it's true length on top.
-                return sizeof(AtlasKeyData) - sizeof(AtlasKeyData::chars) + static_cast<size_t>(charCount) * sizeof(AtlasKeyData::chars[0]);
-            }
-        };
-
-        struct AtlasValueData
+        struct alignas(u32) AtlasEntryValue
         {
             CellFlags flags = CellFlags::None;
-            u16x2 coords[7];
+            u16x2 coords[1];
         };
 
-        struct AtlasValue
+        struct AtlasEntry
         {
-            AtlasValue(CellFlags flags, u16 cellCount, u16x2** coords)
+            AtlasEntry* next;
+            AtlasEntry* prev;
+
+            AtlasEntry* newer;
+            AtlasEntry* older;
+
+            AtlasEntryValue* value;
+
+            u32 allocSize;
+            u32 hash;
+            AtlasEntryKey key;
+        };
+
+        struct unsynchronized_pool_resource
+        {
+            // This is a move-only type
+            unsynchronized_pool_resource() = default;
+            unsynchronized_pool_resource(const unsynchronized_pool_resource&) = delete;
+            unsynchronized_pool_resource& operator=(const unsynchronized_pool_resource&) = delete;
+            unsynchronized_pool_resource(unsynchronized_pool_resource&&) = default;
+            unsynchronized_pool_resource& operator=(unsynchronized_pool_resource&&) = default;
+
+            ~unsynchronized_pool_resource() noexcept
             {
-                __assume(coords != nullptr);
-                const auto size = dataSize(cellCount);
-                const auto data = _data.initialize(size);
-                WI_SetFlagIf(flags, CellFlags::Inlined, _data.would_inline(size));
-                data->flags = flags;
-                *coords = &data->coords[0];
+                release();
             }
 
-            const AtlasValueData* data() const noexcept
+            _NODISCARD __declspec(allocator) void* allocate(_CRT_GUARDOVERFLOW const size_t _Bytes, const size_t _Align = alignof(max_align_t))
+            { // allocate _Bytes bytes of memory with alignment _Align
+                _STL_ASSERT(std::_Is_pow_2(_Align), "memory_resource::allocate(): Alignment must be a power of two.");
+                void* _Ptr = do_allocate(_Bytes, _Align);
+                return ::operator new(_Bytes, _Ptr);
+            }
+
+            void deallocate(void* const _Ptr, const size_t _Bytes, const size_t _Align = alignof(max_align_t))
             {
-                return _data.data();
+                // deallocate _Ptr, which was returned from allocate(_Bytes, _Align)
+                _STL_ASSERT(std::_Is_pow_2(_Align), "memory_resource::deallocate(): Alignment must be a power of two.");
+                return do_deallocate(_Ptr, _Bytes, _Align);
+            }
+
+            void release() noexcept /* strengthened */
+            {
+                // release all allocations back upstream
+                for (auto& _Al : _Pools)
+                {
+                    _Al._Clear();
+                }
+                _Pools.clear();
+                _Pools.shrink_to_fit();
+            }
+
+        protected:
+            void* do_allocate(size_t _Bytes, const size_t _Align)
+            {
+                auto _Result = _Find_pool(_Bytes, _Align);
+                if (_Result.first == _Pools.end() || _Result.first->_Log_of_size != _Result.second)
+                {
+                    _Result.first = _Pools.emplace(_Result.first, _Result.second);
+                }
+
+                return _Result.first->_Allocate();
+            }
+
+            void do_deallocate(void* const _Ptr, const size_t _Bytes, const size_t _Align)
+            {
+                const auto _Result = _Find_pool(_Bytes, _Align);
+                if (_Result.first != _Pools.end() && _Result.first->_Log_of_size == _Result.second)
+                {
+                    _Result.first->_Deallocate(_Ptr);
+                }
             }
 
         private:
-            SmallObjectOptimizer<AtlasValueData> _data;
-
-            static constexpr size_t dataSize(u16 coordCount) noexcept
+            // manager for a collection of chunks comprised of blocks of a single size
+            struct _Pool
             {
-                return sizeof(AtlasValueData) - sizeof(AtlasValueData::coords) + static_cast<size_t>(coordCount) * sizeof(AtlasValueData::coords[0]);
-            }
-        };
+                // a memory allocation consisting of a number of fixed-size blocks to be parceled out
+                struct _Chunk : std::pmr::_Single_link<>
+                {
+                    std::pmr::_Intrusive_stack<_Single_link<>> _Free_blocks{}; // list of free blocks
+                    size_t _Free_count; // # of unallocated blocks
+                    size_t _Capacity; // total # of blocks
+                    char* _Base; // address of first block
+                    size_t _Next_available = 0; // index of first never-allocated block
+                    size_t _Id; // unique identifier; increasing order of allocation
 
-        struct AtlasQueueItem
-        {
-            const AtlasKey* key;
-            const AtlasValue* value;
-        };
+                    // initialize a chunk of _Capacity blocks, all initially free
+                    _Chunk(_Pool& _Al, void* const _Base_, const size_t _Capacity_) noexcept :
+                        _Free_count{ _Capacity_ },
+                        _Capacity{ _Capacity_ },
+                        _Base{ static_cast<char*>(_Base_) },
+                        _Id{ _Al._All_chunks._Empty() ? 0 : _Al._All_chunks._Top()->_Id + 1 }
+                    {
+                    }
 
-        struct AtlasKeyHasher
-        {
-            using is_transparent = int;
+                    _Chunk(const _Chunk&) = delete;
+                    _Chunk& operator=(const _Chunk&) = delete;
+                };
 
-            size_t operator()(const AtlasKey& v) const noexcept
+                _Chunk* _Unfull_chunk = nullptr; // largest _Chunk with free blocks
+                std::pmr::_Intrusive_stack<_Chunk> _All_chunks{}; // all chunks (ordered by decreasing _Id)
+                size_t _Next_capacity = _Default_next_capacity; // # of blocks to allocate in next _Chunk
+                    // in (1, (PTRDIFF_MAX - sizeof(_Chunk)) >> _Log_of_size]
+                size_t _Block_size; // size of allocated blocks
+                size_t _Log_of_size; // _Block_size == 1 << _Log_of_size
+                _Chunk* _Empty_chunk = nullptr; // only _Chunk with all free blocks
+
+                static constexpr size_t _Default_next_capacity = 4;
+                static_assert(_Default_next_capacity > 1);
+
+                explicit _Pool(const size_t _Log_of_size_) noexcept :
+                    _Block_size{ size_t{ 1 } << _Log_of_size_ },
+                    _Log_of_size{ _Log_of_size_ }
+                {
+                }
+
+                _Pool(_Pool&& _That) noexcept :
+                    _Unfull_chunk{ _STD exchange(_That._Unfull_chunk, nullptr) },
+                    _All_chunks{ _STD move(_That._All_chunks) },
+                    _Next_capacity{ _STD exchange(_That._Next_capacity, _Default_next_capacity) },
+                    _Block_size{ _That._Block_size },
+                    _Log_of_size{ _That._Log_of_size },
+                    _Empty_chunk{ _STD exchange(_That._Empty_chunk, nullptr) }
+                {
+                }
+
+                _Pool& operator=(_Pool&& _That) noexcept
+                {
+                    _Unfull_chunk = _STD exchange(_That._Unfull_chunk, nullptr);
+                    _All_chunks = _STD move(_That._All_chunks);
+                    _Next_capacity = _STD exchange(_That._Next_capacity, _Default_next_capacity);
+                    _Block_size = _That._Block_size;
+                    _Log_of_size = _That._Log_of_size;
+                    _Empty_chunk = _STD exchange(_That._Empty_chunk, nullptr);
+                    return *this;
+                }
+
+                void _Clear() noexcept
+                {
+                    // release all chunks in the pool back upstream
+                    std::pmr::_Intrusive_stack<_Chunk> _Tmp{};
+                    _STD swap(_Tmp, _All_chunks);
+                    std::pmr::memory_resource* const _Resource = std::pmr::get_default_resource();
+                    while (!_Tmp._Empty())
+                    {
+                        const auto _Ptr = _Tmp._Pop();
+                        _Resource->deallocate(_Ptr->_Base, _Size_for_capacity(_Ptr->_Capacity), _Block_size);
+                    }
+
+                    _Unfull_chunk = nullptr;
+                    _Next_capacity = _Default_next_capacity;
+                    _Empty_chunk = nullptr;
+                }
+
+                void* _Allocate()
+                { // allocate a block from this pool
+                    for (;; _Unfull_chunk = _All_chunks._As_item(_Unfull_chunk->_Next))
+                    {
+                        if (!_Unfull_chunk)
+                        {
+                            _Increase_capacity();
+                        }
+                        else if (!_Unfull_chunk->_Free_blocks._Empty())
+                        {
+                            if (_Unfull_chunk == _Empty_chunk)
+                            { // this chunk is no longer empty
+                                _Empty_chunk = nullptr;
+                            }
+                            --_Unfull_chunk->_Free_count;
+                            return _Unfull_chunk->_Free_blocks._Pop();
+                        }
+
+                        if (_Unfull_chunk->_Next_available < _Unfull_chunk->_Capacity)
+                        {
+                            if (_Unfull_chunk == _Empty_chunk)
+                            { // this chunk is no longer empty
+                                _Empty_chunk = nullptr;
+                            }
+                            --_Unfull_chunk->_Free_count;
+                            char* const _Block = _Unfull_chunk->_Base + _Unfull_chunk->_Next_available * _Block_size;
+                            ++_Unfull_chunk->_Next_available;
+                            *(reinterpret_cast<_Chunk**>(_Block + _Block_size) - 1) = _Unfull_chunk;
+                            return _Block;
+                        }
+                    }
+                }
+
+                void _Deallocate(void* const _Ptr) noexcept
+                {
+                    // return a block to this pool
+                    _Chunk* _Current = *(reinterpret_cast<_Chunk**>(static_cast<char*>(_Ptr) + _Block_size) - 1);
+
+                    _Current->_Free_blocks._Push(::new (_Ptr) std::pmr::_Single_link<>);
+
+                    if (_Current->_Free_count++ == 0)
+                    {
+                        // prefer to allocate from newer/larger chunks...
+                        if (!_Unfull_chunk || _Unfull_chunk->_Id < _Current->_Id)
+                        {
+                            _Unfull_chunk = _Current;
+                        }
+
+                        return;
+                    }
+
+                    if (_Current->_Free_count < _Current->_Capacity)
+                    {
+                        return;
+                    }
+
+                    if (!_Empty_chunk)
+                    {
+                        _Empty_chunk = _Current;
+                        return;
+                    }
+
+                    // ...and release older/smaller chunks to keep the list lengths short.
+                    if (_Empty_chunk->_Id < _Current->_Id)
+                    {
+                        _STD swap(_Current, _Empty_chunk);
+                    }
+
+                    _All_chunks._Remove(_Current);
+                    std::pmr::get_default_resource()->deallocate(
+                        _Current->_Base, _Size_for_capacity(_Current->_Capacity), _Block_size);
+                }
+
+                size_t _Size_for_capacity(const size_t _Capacity) const noexcept
+                {
+                    // return the size of a chunk that holds _Capacity blocks
+                    return (_Capacity << _Log_of_size) + sizeof(_Chunk);
+                }
+
+                void _Increase_capacity()
+                {
+                    // this pool has no free blocks; get a new chunk from upstream
+                    const size_t _Size = _Size_for_capacity(_Next_capacity);
+                    std::pmr::memory_resource* const _Resource = std::pmr::get_default_resource();
+                    void* const _Ptr = _Resource->allocate(_Size, _Block_size);
+                    std::pmr::_Check_alignment(_Ptr, _Block_size);
+
+                    void* const _Tmp = static_cast<char*>(_Ptr) + _Size - sizeof(_Chunk);
+                    _Unfull_chunk = ::new (_Tmp) _Chunk{ *this, _Ptr, _Next_capacity };
+                    _Empty_chunk = _Unfull_chunk;
+                    _All_chunks._Push(_Unfull_chunk);
+
+                    // scale _Next_capacity by 2, saturating so that _Size_for_capacity(_Next_capacity) cannot overflow
+                    _Next_capacity = std::min(_Next_capacity << 1, (PTRDIFF_MAX - sizeof(_Chunk)) >> _Log_of_size);
+                }
+            };
+
+            std::pair<std::pmr::vector<_Pool>::iterator, unsigned char> _Find_pool(
+                const size_t _Bytes,
+                const size_t _Align) noexcept
             {
-                return v.hash();
+                // find the pool from which to allocate a block with size _Bytes and alignment _Align
+                const size_t _Size = std::max(_Bytes + sizeof(void*), _Align);
+                const auto _Log_of_size = static_cast<unsigned char>(std::_Ceiling_of_log_2(_Size));
+                return { _STD lower_bound(_Pools.begin(), _Pools.end(), _Log_of_size, [](const _Pool& _Al, const unsigned char _Log) { return _Al._Log_of_size < _Log; }), _Log_of_size };
             }
 
-            size_t operator()(const std::list<std::pair<AtlasKey, AtlasValue>>::iterator& v) const noexcept
-            {
-                return operator()(v->first);
-            }
-        };
-
-        struct AtlasKeyEq
-        {
-            using is_transparent = int;
-
-            bool operator()(const AtlasKey& a, const std::list<std::pair<AtlasKey, AtlasValue>>::iterator& b) const noexcept
-            {
-                return a == b->first;
-            }
-
-            bool operator()(const std::list<std::pair<AtlasKey, AtlasValue>>::iterator& a, const std::list<std::pair<AtlasKey, AtlasValue>>::iterator& b) const noexcept
-            {
-                return operator()(a->first, b);
-            }
+            std::pmr::vector<_Pool> _Pools;
         };
 
         struct TileHashMap
         {
-            using iterator = std::list<std::pair<AtlasKey, AtlasValue>>::iterator;
+            TileHashMap() = default;
 
-            TileHashMap() noexcept = default;
-
-            iterator end() noexcept
+            AtlasEntry* findOrInsert(AtlasEntryKeyAttributes attributes, u16 charCount, u16 coordCount, const wchar_t* chars, bool& inserted)
             {
-                return _lru.end();
-            }
+                const auto keySize = nextMultipleOf(calculateKeySize(charCount), sizeof(u32));
+                const auto key = static_cast<AtlasEntryKey*>(_allocator.allocate(keySize, alignof(AtlasEntryKey)));
+                u32 hash;
 
-            iterator find(const AtlasKey& key)
-            {
-                const auto it = _map.find(key);
-                if (it != _map.end())
+                key->attributes = attributes;
+                key->charCount = charCount;
+                key->coordCount = coordCount;
+#pragma warning(suppress : 26490) // Don't use reinterpret_cast (type.1).
                 {
-                    // Move the key to the head of the LRU queue.
-                    makeNewest(*it);
-                    return *it;
+                    // totalSize is rounded up to the next multiple of 4, but
+                    // charCount might only amount to a multiple of 2 (bytes).
+                    // memset()ing the last wchar_t ensures we don't hash uninitialized data.
+                    const auto data = reinterpret_cast<u8*>(key);
+                    memset(data + keySize - 2, 0, 2);
+
+                    // This will potentially overwrite the memset()'d wchar_t above.
+                    std::copy_n(chars, charCount, &key->chars[0]);
+
+                    hash = hashData(data, keySize);
                 }
-                return end();
+
+                {
+                    const auto it = _map[hash & _mapMask];
+                    for (auto entry = it; entry; entry = entry->next)
+                    {
+                        const auto itKeySize = til::bit_cast<uintptr_t>(entry->value) - til::bit_cast<uintptr_t>(&entry->key);
+                        if (itKeySize == keySize && memcmp(key, &entry->key, keySize) == 0)
+                        {
+                            _allocator.deallocate(key, keySize, alignof(AtlasEntryKey));
+
+                            // LRU remove
+                            lruRemove(entry);
+                            lruPush(entry);
+
+                            return entry;
+                        }
+                    }
+                }
+
+                if (_size == _mapSize)
+                {
+                    const auto newMapSize = _mapSize << 1;
+                    const auto newMapMask = newMapSize - 1;
+                    FAIL_FAST_IF(newMapSize <= _mapSize); // overflow
+                    auto newMap = std::make_unique<AtlasEntry*[]>(newMapSize);
+
+                    auto it = _map.get();
+                    const auto end = it + _mapSize;
+                    for (; it != end; ++it)
+                    {
+                        for (auto entry = *it; entry;)
+                        {
+                            const auto next = entry->next;
+                            mapPush(&newMap[entry->hash & newMapMask], entry);
+                            entry = next;
+                        }
+                    }
+
+                    _map = std::move(newMap);
+                    _mapSize = newMapSize;
+                    _mapMask = newMapMask;
+                }
+
+                const auto valueOffset = offsetof(AtlasEntry, key) + keySize;
+                const auto totalSize = valueOffset + calculateValueSize(coordCount);
+                const auto entry = static_cast<AtlasEntry*>(_allocator.allocate(totalSize, alignof(AtlasEntry)));
+                const auto slot = &_map[hash & _mapMask];
+
+                entry->value = til::bit_cast<AtlasEntryValue*>(til::bit_cast<uintptr_t>(entry) + valueOffset);
+                entry->allocSize = gsl::narrow_cast<u32>(totalSize);
+                entry->hash = hash;
+                memcpy(&entry->key, key, keySize);
+
+                mapPush(slot, entry);
+                lruPush(entry);
+
+                _size++;
+
+                inserted = true;
+                return entry;
             }
 
-            iterator insert(AtlasKey&& key, AtlasValue&& value)
+            void popOldestTiles(std::vector<u16x2>& out)
             {
-                // Insert the key/value right at the head of the LRU queue, just like find().
-                //
-                // && decays to & if the argument is named, because C++ is a simple language
-                // and so you have to std::move it again, because C++ is a simple language.
-                _lru.emplace_front(std::move(key), std::move(value));
-                auto it = _lru.begin();
-                _map.emplace(it);
-                return it;
-            }
+                FAIL_FAST_IF(!_size || !_oldest);
 
-            void makeNewest(const iterator& it)
-            {
-                _lru.splice(_lru.begin(), _lru, it);
-            }
+                const auto entry = _oldest;
 
-            void popOldestTiles(std::vector<u16x2>& out) noexcept
-            {
-                Expects(!_lru.empty());
-                const auto it = --_lru.end();
+                if (!entry->newer)
+                {
+                    __debugbreak();
+                }
 
-                const auto key = it->first.data();
-                const auto value = it->second.data();
-                const auto beg = &value->coords[0];
-                const auto cellCount = key->attributes.cellCount;
-
+                const auto slot = &_map[entry->hash & _mapMask];
                 const auto offset = out.size();
+                const auto cellCount = entry->key.coordCount;
                 out.resize(offset + cellCount);
-                std::copy_n(beg, cellCount, out.begin() + offset);
+                std::copy_n(&entry->value->coords[0], cellCount, out.begin() + offset);
 
-                _map.erase(it);
-                _lru.pop_back();
+                mapRemove(slot, entry);
+                lruRemove(entry);
+
+                auto it = std::find(_map.get(), _map.get() + _mapSize, entry);
+                if (it != (_map.get() + _mapSize))
+                {
+                    __debugbreak();
+                }
+
+                _size--;
+
+                _allocator.deallocate(entry, entry->allocSize, alignof(AtlasEntry));
+            }
+
+            void reset() noexcept
+            {
+                _allocator.release();
+                memset(_map.get(), 0, _mapSize * sizeof(_map[0]));
+                _newest = nullptr;
+                _oldest = nullptr;
+                _size = 0;
             }
 
         private:
-            // Please don't copy this code. It's a proof-of-concept.
-            // If you need a LRU hash-map, write a custom one with an intrusive
-            // prev/next linked list (it's easier than you might think!).
-            std::list<std::pair<AtlasKey, AtlasValue>> _lru;
-            std::unordered_set<iterator, AtlasKeyHasher, AtlasKeyEq> _map;
+            static constexpr size_t calculateKeySize(size_t charCount) noexcept
+            {
+                return sizeof(AtlasEntryKey) - sizeof(AtlasEntryKey::chars) + charCount * sizeof(AtlasEntryKey::chars[0]);
+            }
+
+            static constexpr size_t calculateValueSize(size_t coordCount) noexcept
+            {
+                return sizeof(AtlasEntryValue) - sizeof(AtlasEntryValue::coords) + coordCount * sizeof(AtlasEntryValue::coords[0]);
+            }
+
+            static constexpr size_t nextMultipleOf(size_t n, size_t powerOf2) noexcept
+            {
+                return (n + powerOf2 - 1) & ~(powerOf2 - 1);
+            }
+
+            static u32 hashData(const u8* beg, size_t length) noexcept
+            {
+                // This hash function only works with data fully aligned to u32 (including the length).
+                assert(til::bit_cast<uintptr_t>(beg) % sizeof(u32) == 0);
+                assert(length % sizeof(u32) == 0);
+
+                const auto end = beg + length;
+
+                // This loop is a simple LCG (linear congruential generator) with Donald Knuth's
+                // widely used parameters. Unlike with normal LCGs however we mix in
+                // 4 bytes of the input on each iteration using a simple XOR.
+                auto h = UINT64_C(0x243F6A8885A308D3); // fractional digits of pi in hex (OEIS: A062964)
+                for (; beg != end; beg += sizeof(u32))
+                {
+                    // Neither x64 nor ARM64 assembly differentiates between aligned and unaligned loads.
+                    // As such we can freely use the standard compliant way of reading u8*: memcpy().
+                    // (In Release mode this should be inlined to a single instruction.)
+                    u32 v;
+                    memcpy(&v, beg, sizeof(u32));
+                    h = (h ^ v) * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+                }
+
+                // PCG (permuted congruential generator) XSL-RR finalizer.
+                // In testing it seemed sufficient for the purpose of a hash-map key generator.
+                //
+                // Copyright 2014-2017 Melissa O'Neill <oneill@pcg-random.org>, and the PCG Project contributors.
+                // See oss/pcg/LICENSE-MIT.txt, oss/pcg/LICENSE-APACHE.txt or https://www.pcg-random.org/.
+                const int r = h & 63;
+                const auto x = gsl::narrow_cast<u32>(h >> 32) ^ gsl::narrow_cast<u32>(h);
+                return _rotl(x, r);
+            }
+
+            void lruRemove(const AtlasEntry* entry) noexcept
+            {
+                if (entry->newer)
+                {
+                    entry->newer->older = entry->older;
+                }
+                else
+                {
+                    _newest = entry->older;
+                }
+                if (entry->older)
+                {
+                    entry->older->newer = entry->newer;
+                }
+                else
+                {
+                    _oldest = entry->newer;
+                }
+            }
+
+            void lruPush(AtlasEntry* entry) noexcept
+            {
+                if (_newest)
+                {
+                    _newest->newer = entry;
+                }
+                else
+                {
+                    _oldest = entry;
+                }
+                entry->newer = nullptr;
+                entry->older = _newest;
+                _newest = entry;
+            }
+
+            static void mapRemove(AtlasEntry** slot, const AtlasEntry* entry) noexcept
+            {
+                if (entry->prev)
+                {
+                    entry->prev->next = entry->next;
+                }
+                else
+                {
+                    *slot = entry->next;
+                }
+                if (entry->next)
+                {
+                    entry->next->prev = entry->prev;
+                }
+            }
+
+            static void mapPush(AtlasEntry** slot, AtlasEntry* entry) noexcept
+            {
+                if (*slot)
+                {
+                    (*slot)->prev = entry;
+                }
+                entry->next = *slot;
+                entry->prev = nullptr;
+                *slot = entry;
+            }
+
+            static constexpr u32 initialSize = 4;
+
+            unsynchronized_pool_resource _allocator;
+            std::unique_ptr<AtlasEntry*[]> _map = std::make_unique<AtlasEntry*[]>(initialSize);
+            AtlasEntry* _newest = nullptr;
+            AtlasEntry* _oldest = nullptr;
+            u32 _mapSize = initialSize;
+            u32 _mapMask = initialSize - 1;
+            u32 _size = 0;
         };
 
         // TileAllocator yields `tileSize`-sized tiles for our texture atlas.
@@ -697,6 +965,14 @@ namespace Microsoft::Console::Render
                 const auto pos = _cache.back();
                 _cache.pop_back();
                 return pos;
+            }
+
+            void reset() noexcept
+            {
+                _cache.clear();
+                _pos = {};
+                _originX = 0;
+                _canGenerate = true;
             }
 
         private:
@@ -864,10 +1140,10 @@ namespace Microsoft::Console::Render
         __declspec(noinline) void _createSwapChain();
         __declspec(noinline) void _recreateSizeDependentResources();
         __declspec(noinline) void _recreateFontDependentResources();
-        IDWriteTextFormat* _getTextFormat(bool bold, bool italic) const noexcept;
-        const Buffer<DWRITE_FONT_AXIS_VALUE>& _getTextFormatAxis(bool bold, bool italic) const noexcept;
+        IDWriteTextFormat* _getTextFormat(AtlasEntryKeyAttributes attributes) const noexcept;
+        const Buffer<DWRITE_FONT_AXIS_VALUE>& _getTextFormatAxis(AtlasEntryKeyAttributes attributes) const noexcept;
         Cell* _getCell(u16 x, u16 y) noexcept;
-        TileHashMap::iterator* _getCellGlyphMapping(u16 x, u16 y) noexcept;
+        const AtlasEntry** _getCellGlyphMapping(u16 x, u16 y) noexcept;
         void _setCellFlags(u16r coords, CellFlags mask, CellFlags bits) noexcept;
         void _flushBufferLine();
         void _emplaceGlyph(IDWriteFontFace* fontFace, size_t bufferPos1, size_t bufferPos2);
@@ -882,7 +1158,7 @@ namespace Microsoft::Console::Render
         void _updateConstantBuffer() const noexcept;
         void _adjustAtlasSize();
         void _processGlyphQueue();
-        void _drawGlyph(const AtlasQueueItem& item) const;
+        void _drawGlyph(const AtlasEntry& item) const;
         void _drawCursor();
 
         static constexpr bool debugGlyphGenerationPerformance = false;
@@ -930,12 +1206,12 @@ namespace Microsoft::Console::Render
             wil::com_ptr<ID3D11ShaderResourceView> atlasView;
             wil::com_ptr<ID2D1RenderTarget> d2dRenderTarget;
             wil::com_ptr<ID2D1Brush> brush;
-            wil::com_ptr<IDWriteTextFormat> textFormats[2][2];
-            Buffer<DWRITE_FONT_AXIS_VALUE> textFormatAxes[2][2];
+            wil::com_ptr<IDWriteTextFormat> textFormats[4];
+            Buffer<DWRITE_FONT_AXIS_VALUE> textFormatAxes[4];
             wil::com_ptr<IDWriteTypography> typography;
 
             Buffer<Cell, 32> cells; // invalidated by ApiInvalidations::Size
-            Buffer<TileHashMap::iterator> cellGlyphMapping; // invalidated by ApiInvalidations::Size
+            Buffer<const AtlasEntry*> cellGlyphMapping; // invalidated by ApiInvalidations::Size
             f32x2 cellSizeDIP; // invalidated by ApiInvalidations::Font, caches _api.cellSize but in DIP
             u16x2 cellSize; // invalidated by ApiInvalidations::Font, caches _api.cellSize
             u16x2 cellCount; // invalidated by ApiInvalidations::Font|Size, caches _api.cellCount
@@ -946,7 +1222,7 @@ namespace Microsoft::Console::Render
             u16x2 atlasSizeInPixel; // invalidated by ApiInvalidations::Font
             TileHashMap glyphs;
             TileAllocator tileAllocator;
-            std::vector<AtlasQueueItem> glyphQueue;
+            std::vector<const AtlasEntry*> glyphQueue;
 
             f32 gamma = 0;
             f32 cleartypeEnhancedContrast = 0;
@@ -990,7 +1266,7 @@ namespace Microsoft::Console::Render
             // UpdateDrawingBrushes()
             u32 backgroundOpaqueMixin = 0xff000000; // changes are flagged as ApiInvalidations::Device
             u32x2 currentColor;
-            AtlasKeyAttributes attributes{};
+            AtlasEntryKeyAttributes attributes = AtlasEntryKeyAttributes::None;
             u16x2 lastPaintBufferLineCoord;
             CellFlags flags = CellFlags::None;
             // SetSelectionBackground()
